@@ -1,0 +1,163 @@
+name: ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        default: 'latest'
+        description: 'Package version'
+        type: string
+        required: true
+  schedule:
+    - cron: '0 20 * * *'
+
+env:
+  app_name: 'sccache'
+  app_repo: 'mozilla/sccache'
+
+jobs:
+  check:
+    runs-on: ubuntu-slim
+    outputs:
+      app_version: ${{ steps.get-version.outputs.app_version }}
+      app_build: ${{ steps.check-release.outputs.app_build }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get Version
+        id: get-version
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.version }}" = "latest" ]; then
+            app_version=$(curl -s "https://api.github.com/repos/${{ env.app_repo }}/releases/latest" | jq -r .tag_name)
+          else
+            app_version=${{ github.event.inputs.version }}
+          fi
+          if [ -z "${app_version}" ] || [ "${app_version}" == "null" ]; then
+            echo "Failed to get version"
+            exit 1
+          fi
+          
+          echo "app_version=${app_version}" >> $GITHUB_ENV
+          echo "app_version=${app_version}" >> $GITHUB_OUTPUT
+          echo ""
+          echo "========== Build Args =========="
+          echo "app_version=${app_version}"
+
+      - name: Check Release
+        id: check-release
+        run: |
+          gh release view ${app_version} -R ${{ github.repository }} | grep ${{ env.app_name }}-${{ env.app_version }}-loongarch64-unknown-linux-gnu.tar.gz >/dev/null 2>&1 || echo "app_build=1" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ fromJson(matrix.container || '{"image":null}') }}
+    if: needs.check.outputs.app_build == '1'
+    needs: check
+    env:
+      app_version: ${{ needs.check.outputs.app_version }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: loongarch64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: loongarch64-unknown-linux-musl
+            container: '{"image": "messense/rust-musl-cross:loongarch64-musl"}'
+            lto: "false"
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.app_repo }}
+          ref: ${{ env.app_version }}
+
+      - name: Install rust
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+        if: ${{ !matrix.container }}
+
+      - name: Install loongarch64 cross-compilation toolchain
+        if: ${{ matrix.target == 'loongarch64-unknown-linux-gnu' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13-loongarch64-linux-gnu
+          sudo update-alternatives \
+            --install /usr/bin/loongarch64-linux-gnu-gcc loongarch64-linux-gnu-gcc /usr/bin/loongarch64-linux-gnu-gcc-13 100 \
+            --slave /usr/bin/loongarch64-linux-gnu-gcc-ar loongarch64-linux-gnu-gcc-ar /usr/bin/loongarch64-linux-gnu-gcc-ar-13 \
+            --slave /usr/bin/loongarch64-linux-gnu-gcc-nm loongarch64-linux-gnu-gcc-nm /usr/bin/loongarch64-linux-gnu-gcc-nm-13 \
+            --slave /usr/bin/loongarch64-linux-gnu-gcc-ranlib loongarch64-linux-gnu-gcc-ranlib /usr/bin/loongarch64-linux-gnu-gcc-ranlib-13 \
+            --slave /usr/bin/loongarch64-linux-gnu-gcov loongarch64-linux-gnu-gcov /usr/bin/loongarch64-linux-gnu-gcov-13
+          sudo update-alternatives \
+            --install /usr/bin/loongarch64-linux-gnu-g++ loongarch64-linux-gnu-g++ /usr/bin/loongarch64-linux-gnu-g++-13 100
+          sudo update-alternatives \
+            --install /usr/bin/loongarch64-linux-gnu-cpp loongarch64-linux-gnu-cpp /usr/bin/loongarch64-linux-gnu-cpp-13 100
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.loongarch64-unknown-linux-gnu]
+          linker = "loongarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build
+        run: cargo build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }}
+        env:
+          RUSTFLAGS: ${{ env.RUSTFLAGS || matrix.rustflags }}
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto || 'true' }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.binary || 'sccache' }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary || 'sccache' }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
+          if-no-files-found: error
+
+  release:
+    if: needs.check.outputs.app_build == '1'
+    runs-on: ubuntu-slim
+    needs:
+      - check
+      - build
+    env:
+      app_version: ${{ needs.check.outputs.app_version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get artifacts
+        uses: actions/download-artifact@v8
+
+      - name: Create release assets
+        run: |
+          for d in sccache-*; do
+            chmod +x "$d/sccache"*
+            cp README.md LICENSE "$d/"
+            tar -zcvf "$d.tar.gz" "$d"
+            echo -n "$(shasum -ba 256 "$d.tar.gz" | cut -d " " -f 1)" > "$d.tar.gz.sha256"
+            if [[ $d =~ sccache-.*-pc-windows-.* ]]; then
+              zip -r "$d.zip" "$d"
+              echo -n "$(shasum -ba 256 "$d.zip" | cut -d " " -f 1)" > "$d.zip.sha256"
+            fi
+          done
+
+          mkdir -p dist
+          for f in sccache-*.tar.gz* sccache-*.zip*; do
+              if [[ -f "$f" ]]; then
+                  mv "$f" dist/
+              fi
+          done
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ env.app_version }}"
+          gh release create "${TAG_NAME}" \
+            --generate-notes \
+            --title "${TAG_NAME}" \
+            dist/*
