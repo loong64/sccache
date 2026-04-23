@@ -69,6 +69,10 @@ jobs:
             target: loongarch64-unknown-linux-musl
             container: '{"image": "messense/rust-musl-cross:loongarch64-musl"}'
             rustflags: -Ctarget-feature=+crt-static
+          - os: ubuntu-24.04
+            target: riscv64gc-unknown-linux-musl
+            container: '{"image": "messense/rust-musl-cross:riscv64gc-musl"}'
+            rustflags: -Ctarget-feature=+crt-static
 
     steps:
       - name: Clone repository
